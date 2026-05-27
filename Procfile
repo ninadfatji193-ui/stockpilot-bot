@@ -1,1 +1,1 @@
-worker: python stock_news_bot.py
+worker: python stockpilot_v3.py
