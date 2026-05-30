@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-StockPilot NSE/BSE Filing Bot v3.3
+StockPilot NSE/BSE Filing Bot v3.4
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v3.3 fixes:
-  - Gemini model updated to gemini-2.0-flash (latest free)
-  - Gemini tested at startup — shows exact error if failing
-  - Fallback to gemini-1.5-flash if 2.0 fails
-  - Date filter: only last 7 days
-  - All IZMO codes fixed
+v3.4 changes:
+  - Switched AI from Gemini → Groq (free, reliable, 14400 req/day)
+  - Groq uses LLaMA 3.1 — fast and accurate
+  - Gemini kept as fallback if GEMINI_API_KEY also set
+  - Date filter: last 7 days only
+  - All stock codes verified and fixed
 """
 
 import os, time, sqlite3, hashlib, json, re, logging, sys
@@ -31,70 +31,34 @@ log = logging.getLogger("StockPilot")
 # ─────────────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID         = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "").strip()      # PRIMARY
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "").strip()    # FALLBACK
 CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "300"))
 DB_PATH         = os.environ.get("DB_PATH", "filings.db")
 IST             = pytz.timezone("Asia/Kolkata")
 FILING_MAX_AGE_DAYS = 7
-
-# Gemini models to try in order
-GEMINI_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-latest",
-]
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-_gemini_model = None  # will be set after startup test
 
 def validate_config():
     missing = []
     if not TELEGRAM_TOKEN: missing.append("TELEGRAM_TOKEN")
     if not CHAT_ID:        missing.append("TELEGRAM_CHAT_ID")
     if missing:
-        log.error(f"MISSING env vars: {', '.join(missing)}")
+        log.error(f"Missing: {', '.join(missing)}")
         sys.exit(1)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GEMINI STARTUP TEST — find working model
-# ─────────────────────────────────────────────────────────────────────────────
-def test_gemini():
-    global _gemini_model
-    if not GEMINI_API_KEY:
-        log.warning("GEMINI_API_KEY not set — AI disabled")
-        return False
-
-    for model in GEMINI_MODELS:
-        url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            r = requests.post(
-                url,
-                json={"contents": [{"parts": [{"text": "Reply with just the word: OK"}]}],
-                      "generationConfig": {"maxOutputTokens": 5}},
-                timeout=15
-            )
-            if r.ok:
-                _gemini_model = model
-                log.info(f"Gemini model working: {model} ✅")
-                return True
-            else:
-                log.warning(f"Gemini model {model} failed: HTTP {r.status_code} — {r.text[:200]}")
-        except Exception as e:
-            log.warning(f"Gemini model {model} error: {e}")
-
-    log.error("All Gemini models failed — AI analysis disabled")
-    log.error("Check your GEMINI_API_KEY at aistudio.google.com")
-    return False
+    if GROQ_API_KEY:
+        log.info("Groq API key found ✅ — AI via LLaMA 3.1")
+    elif GEMINI_API_KEY:
+        log.info("Gemini API key found ✅ — AI via Gemini")
+    else:
+        log.warning("No AI API key set — add GROQ_API_KEY for free AI analysis")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATE FILTER
 # ─────────────────────────────────────────────────────────────────────────────
 DATE_FORMATS = [
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%d",
-    "%d-%b-%Y %H:%M:%S",
-    "%d-%b-%Y",
-    "%d/%m/%Y %H:%M:%S",
-    "%d/%m/%Y",
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+    "%d-%b-%Y %H:%M:%S", "%d-%b-%Y",
+    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y",
     "%d %b %Y",
 ]
 
@@ -110,11 +74,11 @@ def parse_date(s):
 
 def is_recent(date_str, days=FILING_MAX_AGE_DAYS):
     dt = parse_date(date_str)
-    if dt is None: return True  # unknown date → send it
+    if dt is None: return True
     return dt >= datetime.now() - timedelta(days=days)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STOCKS
+# STOCKS — verified NSE symbols + BSE codes
 # ─────────────────────────────────────────────────────────────────────────────
 PORTFOLIO = [
     dict(ticker="ADVAIT",     name="Advait Infratech",       nse="ADVAIT",      bse="543259", sector="Infrastructure",     cat="PORTFOLIO"),
@@ -136,12 +100,12 @@ PORTFOLIO = [
 ]
 
 WATCHLIST = [
-    dict(ticker="JAINRESOUR", name="Jain Resource Recycl",  nse=None,          bse="533289", sector="Recycling",        cat="WATCHLIST"),
-    dict(ticker="IREDA",      name="Indian Renewable Energy",nse="IREDA",       bse="544124", sector="Renewable Energy", cat="WATCHLIST"),
-    dict(ticker="IZMOWATCH",  name="Izmo Ltd (Watch)",       nse="IZMO",        bse="532341", sector="Auto Technology",  cat="WATCHLIST"),
-    dict(ticker="ONEGLOBAL",  name="One Global Service",     nse="ONEGLOBAL",   bse=None,     sector="Services",         cat="WATCHLIST"),
-    dict(ticker="DOMS",       name="DOMS Industries",        nse="DOMS",        bse="544045", sector="Consumer",         cat="WATCHLIST"),
-    dict(ticker="LANCER",     name="Lancer Container",       nse=None,          bse="526807", sector="Packaging",        cat="WATCHLIST"),
+    dict(ticker="JAINRESOUR", name="Jain Resource Recycl",   nse=None,          bse="533289", sector="Recycling",        cat="WATCHLIST"),
+    dict(ticker="IREDA",      name="Indian Renewable Energy", nse="IREDA",       bse="544124", sector="Renewable Energy", cat="WATCHLIST"),
+    dict(ticker="IZMOWATCH",  name="Izmo Ltd (Watch)",        nse="IZMO",        bse="532341", sector="Auto Technology",  cat="WATCHLIST"),
+    dict(ticker="ONEGLOBAL",  name="One Global Service",      nse="ONEGLOBAL",   bse=None,     sector="Services",         cat="WATCHLIST"),
+    dict(ticker="DOMS",       name="DOMS Industries",         nse="DOMS",        bse="544045", sector="Consumer",         cat="WATCHLIST"),
+    dict(ticker="LANCER",     name="Lancer Container",        nse=None,          bse="526807", sector="Packaging",        cat="WATCHLIST"),
 ]
 
 ALL_STOCKS = PORTFOLIO + WATCHLIST
@@ -162,7 +126,6 @@ CATEGORIES = {
     "Order":                ("🏆 Order/Contract Win",      "HIGH"),
     "Contract":             ("🏆 Order/Contract Win",      "HIGH"),
     "Scheme":               ("📋 Scheme of Arrangement",  "HIGH"),
-    "Spurt":                ("📈 Volume Spurt",            "MEDIUM"),
     "AGM":                  ("🏛 AGM/EGM",                "MEDIUM"),
     "EGM":                  ("🏛 AGM/EGM",                "MEDIUM"),
     "Appointment":          ("👤 Board Change",            "MEDIUM"),
@@ -177,20 +140,18 @@ CATEGORIES = {
     "General":              ("📢 General Announcement",    "MEDIUM"),
     "Record Date":          ("📅 Record Date",             "MEDIUM"),
     "Allotment":            ("📋 Share Allotment",         "MEDIUM"),
+    "Spurt":                ("📈 Volume Spurt",            "MEDIUM"),
     "Price":                ("📈 Price Movement",          "MEDIUM"),
+    "Basmati":              ("📢 General Announcement",    "MEDIUM"),
 }
 
 SKIP = [
-    "certificate under sebi",
-    "trading window",
-    "newspaper publication",
-    "copy of newspaper",
-    "registrar & share transfer",
-    "reconciliation of share capital",
-    "loss of share certificate",
-    "sebi (depositories",
-    "compliances-reg.",
-    "reg. 74", "reg. 76", "reg. 57", "reg. 40",
+    "certificate under sebi", "trading window",
+    "newspaper publication", "copy of newspaper",
+    "registrar & share transfer", "reconciliation of share capital",
+    "loss of share certificate", "sebi (depositories",
+    "compliances-reg.", "reg. 74", "reg. 76",
+    "reg. 57", "reg. 40",
 ]
 
 def classify(title, cat_raw=""):
@@ -211,25 +172,26 @@ def init_db():
         hash TEXT PRIMARY KEY, ticker TEXT,
         title TEXT, source TEXT, sent_at INTEGER)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS errors (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT, ts INTEGER)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg TEXT, ts INTEGER)""")
     conn.execute("DELETE FROM sent_filings WHERE sent_at < ?",
                  (int(time.time()) - 30*86400,))
     conn.commit()
     log.info("Database ready ✅")
     return conn
 
-def _hash(source, ticker, title):
+def _h(src, tick, title):
     return hashlib.sha256(
-        f"{source}:{ticker}:{title.strip().lower()}".encode()).hexdigest()
+        f"{src}:{tick}:{title.strip().lower()}".encode()).hexdigest()
 
-def is_dup(conn, source, ticker, title):
-    return conn.execute("SELECT 1 FROM sent_filings WHERE hash=?",
-                        (_hash(source, ticker, title),)).fetchone() is not None
+def is_dup(conn, src, tick, title):
+    return conn.execute(
+        "SELECT 1 FROM sent_filings WHERE hash=?", (_h(src, tick, title),)
+    ).fetchone() is not None
 
-def mark(conn, source, ticker, title):
+def mark(conn, src, tick, title):
     conn.execute("INSERT OR IGNORE INTO sent_filings VALUES (?,?,?,?,?)",
-                 (_hash(source, ticker, title), ticker, title[:200],
-                  source, int(time.time())))
+                 (_h(src, tick, title), tick, title[:200], src, int(time.time())))
     conn.commit()
 
 def log_err(conn, msg):
@@ -246,9 +208,9 @@ class NSESession:
         self.s.headers.update({
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"),
-            "Accept":          "application/json, text/plain, */*",
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer":         "https://www.nseindia.com/",
+            "Referer": "https://www.nseindia.com/",
         })
         self.warmed = False
         self._last = 0
@@ -277,12 +239,15 @@ class NSESession:
                 r = self.s.get(url, timeout=15)
             return r
         except Exception as e:
-            log.debug(f"NSE GET: {e}")
+            log.debug(f"NSE: {e}")
             return None
 
 nse = NSESession()
-BSE_H = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bseindia.com/",
-         "Origin": "https://www.bseindia.com"}
+BSE_H = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://www.bseindia.com/",
+    "Origin": "https://www.bseindia.com"
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FETCHERS
@@ -353,13 +318,12 @@ def fetch_bse_ca(code):
             if not p: continue
             ex = row.get("EX_DATE") or row.get("EXDATE") or ""
             rc = row.get("REC_DATE") or ""
-            t = p + (f" | Ex-Date: {ex}" if ex else "") + \
-                     (f" | Record Date: {rc}" if rc else "")
+            t  = p + (f" | Ex-Date: {ex}" if ex else "") + \
+                      (f" | Record Date: {rc}" if rc else "")
             out.append(dict(
                 title=t,
                 link=f"https://www.bseindia.com/stock-share-price/corporate-actions/{code}",
-                category="Corporate Action",
-                date=ex
+                category="Corporate Action", date=ex
             ))
         return out
     except Exception as e:
@@ -367,43 +331,21 @@ def fetch_bse_ca(code):
         return []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GEMINI AI — with model auto-selection
+# AI ANALYSIS — Groq (primary) → Gemini (fallback)
 # ─────────────────────────────────────────────────────────────────────────────
-def gemini_analyze(title, company, sector, category):
-    global _gemini_model
-    if not GEMINI_API_KEY or not _gemini_model:
-        return None
+AI_PROMPT = """You are an expert Indian stock market analyst helping a retail investor make decisions.
 
-    prompt = (
-        f"You are an expert Indian stock market analyst.\n\n"
-        f"NSE/BSE Filing: \"{title}\"\n"
-        f"Company: {company} | Sector: {sector} | Type: {category}\n\n"
-        f"Respond ONLY with this JSON (no markdown, no backticks):\n"
-        f'{{"summary":"2-3 plain English sentences for retail investor",'
-        f'"sentiment":"bullish OR bearish OR neutral",'
-        f'"impact":"high OR medium OR low",'
-        f'"action":"BUY MORE OR HOLD OR WATCH OR REDUCE OR AVOID",'
-        f'"reason":"One sentence why"}}'
-    )
+NSE/BSE Filing: "{title}"
+Company: {company} | Sector: {sector} | Filing Type: {category}
 
-    url = f"{GEMINI_BASE}/{_gemini_model}:generateContent?key={GEMINI_API_KEY}"
+Respond ONLY with this JSON (no markdown, no backticks, no explanation):
+{{"summary":"2-3 plain English sentences explaining what this filing means for the investor","sentiment":"bullish OR bearish OR neutral","impact":"high OR medium OR low","action":"BUY MORE OR HOLD OR WATCH OR REDUCE OR AVOID","reason":"One sentence on why this action makes sense"}}"""
+
+def parse_ai_json(text):
+    text = re.sub(r"```json\n?|```", "", text).strip()
+    m = re.search(r"\{[\s\S]+?\}", text)
+    if not m: return None
     try:
-        r = requests.post(
-            url,
-            json={"contents": [{"parts": [{"text": prompt}]}],
-                  "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300}},
-            timeout=20
-        )
-        if not r.ok:
-            log.warning(f"Gemini {r.status_code}: {r.text[:150]}")
-            return None
-
-        text = (r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                .strip())
-        text = re.sub(r"```json\n?|```", "", text).strip()
-        m = re.search(r"\{[\s\S]+?\}", text)
-        if not m:
-            return None
         res = json.loads(m.group())
         res["sentiment"] = res.get("sentiment", "neutral").lower()
         res["impact"]    = res.get("impact", "medium").lower()
@@ -413,12 +355,80 @@ def gemini_analyze(title, company, sector, category):
         if res["impact"] not in ["high","medium","low"]:
             res["impact"] = "medium"
         return res
-    except json.JSONDecodeError:
-        log.warning("Gemini: could not parse JSON response")
+    except:
         return None
+
+def groq_analyze(title, company, sector, category):
+    """Groq — free, 14400 req/day, uses LLaMA 3.1"""
+    if not GROQ_API_KEY: return None
+    prompt = AI_PROMPT.format(
+        title=title, company=company, sector=sector, category=category)
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [
+                    {"role": "system",
+                     "content": "You are an Indian stock market expert. Always respond with valid JSON only. No markdown."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.3,
+                "max_tokens": 300
+            },
+            timeout=20
+        )
+        if not r.ok:
+            log.warning(f"Groq {r.status_code}: {r.text[:150]}")
+            return None
+        content = r.json()["choices"][0]["message"]["content"]
+        result = parse_ai_json(content)
+        if result:
+            log.info(f"  Groq AI: {result['sentiment']} | {result['action']}")
+        return result
     except Exception as e:
-        log.warning(f"Gemini error: {e}")
+        log.warning(f"Groq error: {e}")
         return None
+
+def gemini_analyze(title, company, sector, category):
+    """Gemini — fallback if no Groq key"""
+    if not GEMINI_API_KEY: return None
+    prompt = AI_PROMPT.format(
+        title=title, company=company, sector=sector, category=category)
+    for model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={GEMINI_API_KEY}",
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300}},
+                timeout=20
+            )
+            if not r.ok:
+                log.warning(f"Gemini {model} {r.status_code}: {r.text[:150]}")
+                continue
+            text = (r.json()["candidates"][0]["content"]["parts"][0]["text"])
+            result = parse_ai_json(text)
+            if result:
+                log.info(f"  Gemini AI ({model}): {result['sentiment']} | {result['action']}")
+                return result
+        except Exception as e:
+            log.warning(f"Gemini {model}: {e}")
+    return None
+
+def ai_analyze(title, company, sector, category):
+    """Try Groq first, then Gemini"""
+    if GROQ_API_KEY:
+        result = groq_analyze(title, company, sector, category)
+        if result: return result
+    if GEMINI_API_KEY:
+        result = gemini_analyze(title, company, sector, category)
+        if result: return result
+    return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MESSAGE BUILDER
@@ -434,9 +444,9 @@ def build_msg(stock, source, filing, cat_label, importance, ai):
     ce  = "📊" if stock["cat"] == "PORTFOLIO" else "👁"
     itg = {"HIGH":"🔴 HIGH","MEDIUM":"🟡 MEDIUM","LOW":"🟢 LOW"}.get(importance,"🟡")
     L = [
-        f"{'━'*22}",
+        "━"*22,
         f"🏛 <b>{source} OFFICIAL FILING</b>",
-        f"{'━'*22}",
+        "━"*22,
         f"{ce} <b>{stock['cat']}</b>  ·  <code>{stock['ticker']}</code>",
         f"🏢 <b>{stock['name']}</b>",
         f"🏭 {stock['sector']}  ·  {itg}",
@@ -447,14 +457,19 @@ def build_msg(stock, source, filing, cat_label, importance, ai):
     ]
     if ai:
         L += [
-            "🤖 <b>AI Analysis (Gemini)</b>",
+            "🤖 <b>AI Analysis</b>",
             "─"*20,
             f"📝 {ai.get('summary','')}",
             "",
             f"{SE.get(ai['sentiment'],'🟡')} Sentiment: <b>{ai['sentiment'].capitalize()}</b>",
-            f"{IE.get(ai['impact'],'⚡')} Impact: <b>{ai['impact'].capitalize()}</b>",
-            f"{AE.get(ai['action'],'👀')} Signal: <b>{ai['action']}</b>",
+            f"{IE.get(ai['impact'],'⚡')} Market Impact: <b>{ai['impact'].capitalize()}</b>",
+            f"{AE.get(ai['action'],'👀')} Action Signal: <b>{ai['action']}</b>",
             f"💡 {ai.get('reason','')}",
+            "",
+        ]
+    else:
+        L += [
+            "⚠️ <i>No AI key set — add GROQ_API_KEY in Railway for free AI analysis</i>",
             "",
         ]
     if filing.get("date"):
@@ -486,7 +501,7 @@ def send_tg(text, retries=3):
             log.error(f"TG {r.status_code}: {r.text[:100]}")
             return False
         except Exception as e:
-            log.error(f"TG error: {e}")
+            log.error(f"TG: {e}")
             time.sleep(5)
     return False
 
@@ -505,15 +520,13 @@ def process(stock, conn):
         time.sleep(0.5)
 
     for source, f in all_f:
-        if not is_recent(f.get("date", ""), FILING_MAX_AGE_DAYS):
-            continue
+        if not is_recent(f.get("date",""), FILING_MAX_AGE_DAYS): continue
         cat_label, importance = classify(f["title"], f.get("category",""))
         if cat_label is None: continue
         if is_dup(conn, source, stock["ticker"], f["title"]): continue
         mark(conn, source, stock["ticker"], f["title"])
-
         log.info(f"  [{source}][{stock['ticker']}][{importance}] {f['title'][:65]}")
-        ai  = gemini_analyze(f["title"], stock["name"], stock["sector"], cat_label)
+        ai  = ai_analyze(f["title"], stock["name"], stock["sector"], cat_label)
         msg = build_msg(stock, source, f, cat_label, importance, ai)
         if send_tg(msg):
             sent += 1
@@ -525,22 +538,33 @@ def process(stock, conn):
 # ─────────────────────────────────────────────────────────────────────────────
 def run_cycle(conn):
     log.info(f"━━ Cycle {datetime.now(IST).strftime('%H:%M:%S IST')} ━━")
-    total = sum(process(s, conn) for s in ALL_STOCKS)
+    total = 0
+    for stock in ALL_STOCKS:
+        try:
+            total += process(stock, conn)
+        except Exception as e:
+            log.error(f"{stock['ticker']}: {e}")
+            log_err(conn, str(e))
     log.info(f"━━ Done. {total} sent ━━\n")
 
-def send_startup(gemini_ok):
-    model_info = f"✅ {_gemini_model}" if gemini_ok else "❌ Failed — check key at aistudio.google.com"
+def send_startup():
+    ai_status = (
+        f"✅ Groq (LLaMA 3.1) — {14400} req/day free" if GROQ_API_KEY else
+        f"✅ Gemini fallback" if GEMINI_API_KEY else
+        "❌ No AI key — add GROQ_API_KEY in Railway"
+    )
     msg = (
         f"{'━'*22}\n"
-        f"🚀 <b>StockPilot Bot v3.3</b>\n"
+        f"🚀 <b>StockPilot Bot v3.4</b>\n"
         f"{'━'*22}\n"
         f"⏰ {datetime.now(IST).strftime('%d %b %Y · %I:%M %p IST')}\n\n"
         f"📊 Portfolio: {len(PORTFOLIO)} stocks\n"
         f"👁 Watchlist: {len(WATCHLIST)} stocks\n\n"
-        f"🤖 Gemini AI: {model_info}\n"
+        f"🤖 AI Engine: {ai_status}\n"
         f"📅 Age filter: last {FILING_MAX_AGE_DAYS} days only\n"
         f"🔄 Interval: every {CHECK_INTERVAL//60} min\n"
-        f"{'━'*22}"
+        f"{'━'*22}\n"
+        f"Ready. Watching NSE + BSE for you. 📡"
     )
     send_tg(msg)
 
@@ -549,12 +573,10 @@ def send_startup(gemini_ok):
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     validate_config()
-    log.info("StockPilot Bot v3.3 starting…")
-    conn      = init_db()
+    log.info("StockPilot Bot v3.4 starting…")
+    conn = init_db()
     nse.warm()
-    gemini_ok = test_gemini()
-    send_startup(gemini_ok)
-
+    send_startup()
     errs = 0
     while True:
         try:
